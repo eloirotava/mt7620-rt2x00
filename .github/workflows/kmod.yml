@@ -3,6 +3,9 @@ name: rt2x00-kmod
 on:
   push:
     branches: [main]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/kmod.yml'
   workflow_dispatch:
 
 env:
