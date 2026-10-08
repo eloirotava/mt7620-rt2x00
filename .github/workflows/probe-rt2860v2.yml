@@ -50,7 +50,10 @@ jobs:
           sed -i 's#-Idrivers/net/wireless/rt2860v2#-I$(src)/../rt2860v2#g' work/rt2860v2_ap/Makefile
           # headers que mudaram de lugar no 6.x
           cp -r probe/compat work/compat
-          sed -i '1i EXTRA_CFLAGS += -I$(src)/../compat' work/rt2860v2_ap/Makefile
+          # no fim: a 1a linha do Makefile e "EXTRA_CFLAGS = ..." (sobrescreve),
+          # e EXTRA_CFLAGS e obsoleto no Kbuild novo
+          printf '\nccflags-y += -I$(src)/../compat $(EXTRA_CFLAGS)\n' >> work/rt2860v2_ap/Makefile
+          tail -3 work/rt2860v2_ap/Makefile
 
       - name: Compila (make -k)
         run: |
