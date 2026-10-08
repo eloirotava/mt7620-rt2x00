@@ -1,0 +1,555 @@
+From: Eloi Rotava <eloi@rotava.com>
+Subject: [PATCH] rt2x00: add MT7620 DPD calibration for the internal PA
+
+The MT7620 (RT6352) calibration sequence ported from the vendor driver
+was missing the digital pre-distortion step for devices using the
+internal PA.  Without it, high MCS rates show a large TX retry rate
+even at short range.
+
+Port DPD_Calibration/DoDPDCalibration from the MediaTek rt2860v2
+driver and run it in calibration stage 2, between LOFT/IQ and the
+second RxDCOC, as the vendor driver does.  Like the vendor driver,
+DPD only runs when the target power is between 15 and 20 dBm.
+
+diff --git drivers/net/wireless/ralink/rt2x00/rt2800lib.c drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+index 311619b..3e3fcb4 100644
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+@@ -25,6 +25,8 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/unaligned.h>
++#include <linux/etherdevice.h>
+ #include <linux/of.h>
+ 
+ #include "rt2x00.h"
+@@ -10481,6 +10483,518 @@ static void rt2800_calibration_rt6352_stage1(struct rt2x00_dev *rt2x00dev)
+ 	rt2800_r_calibration(rt2x00dev);
+ }
+ 
++/*
++ * MT7620 DPD (digital pre-distortion) calibration for the internal PA.
++ *
++ * Ported from the MediaTek rt2860v2 driver (common/cmm_rf_cal.c:
++ * RtmpKickOutHwNullFrame, DPD_Calibration, DoDPDCalibration,
++ * DPD_IQ_Swap_AM_PM_Inversion, DPD_AM_AM_LUT_Scaling).
++ */
++#define RT6352_DPD_MAX_RETRY		5
++#define RT6352_DPD_PASS_THRES		5
++
++static const u8 rt6352_dpd_vga_code[] = {
++	0x04, 0x05, 0x06, 0x07, 0x08, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
++	0x11, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
++};
++
++struct rt6352_dpd_state {
++	int alc_tag[2][2];	/* [chain][tag0/tag1] */
++	bool tag_ok[2][2];
++};
++
++static void rt2800_wait_mac_idle_rt6352(struct rt2x00_dev *rt2x00dev,
++					int loops, int delay)
++{
++	int i;
++
++	for (i = 0; i < loops; i++) {
++		if (!(rt2800_register_read(rt2x00dev, MAC_STATUS_CFG) & 0x3))
++			return;
++		udelay(delay);
++	}
++	rt2x00_warn(rt2x00dev, "DPD: MAC TX/RX not idle\n");
++}
++
++/* Null data frame in the CTS-to-self area, sent through the PA by DPD */
++static void rt2800_dpd_prepare_null_frame(struct rt2x00_dev *rt2x00dev)
++{
++	u8 frame[24] = { 0 };
++	__le32 txwi[4] = { 0 };
++	u32 word;
++	int i;
++
++	/* TXWI: HT mixed, MCS 15, 20 MHz, no ack, 24 bytes */
++	word = 0;
++	rt2x00_set_field32(&word, TXWI_W0_MCS, 15);
++	rt2x00_set_field32(&word, TXWI_W0_PHYMODE, RATE_MODE_HT_MIX);
++	txwi[0] = cpu_to_le32(word);
++
++	word = 0;
++	rt2x00_set_field32(&word, TXWI_W1_NSEQ, 1);
++	rt2x00_set_field32(&word, TXWI_W1_WIRELESS_CLI_ID, 0xff);
++	rt2x00_set_field32(&word, TXWI_W1_MPDU_TOTAL_BYTE_COUNT, sizeof(frame));
++	rt2x00_set_field32(&word, TXWI_W1_PACKETID, 15);
++	txwi[1] = cpu_to_le32(word);
++
++	/* data, null function, from DS */
++	frame[0] = 0x48;
++	frame[1] = 0x02;
++	eth_broadcast_addr(&frame[4]);
++	memcpy(&frame[10], rt2x00dev->hw->wiphy->perm_addr, ETH_ALEN);
++	memcpy(&frame[16], rt2x00dev->hw->wiphy->perm_addr, ETH_ALEN);
++
++	for (i = 0; i < ARRAY_SIZE(txwi); i++)
++		rt2800_register_write(rt2x00dev, HW_CS_CTS_BASE + 4 * i,
++				      le32_to_cpu(txwi[i]));
++	for (i = 0; i < sizeof(frame); i += 4)
++		rt2800_register_write(rt2x00dev,
++				      HW_CS_CTS_BASE + sizeof(txwi) + i,
++				      get_unaligned_le32(&frame[i]));
++}
++
++static void rt2800_dpd_kick_null_frame(struct rt2x00_dev *rt2x00dev)
++{
++	int i;
++
++	rt2800_register_write(rt2x00dev, PBF_CTRL, 0x80);
++	for (i = 0; i < 200; i++) {
++		if (!(rt2800_register_read(rt2x00dev, PBF_CTRL) & 0x80))
++			return;
++		udelay(100);
++	}
++	rt2x00_warn(rt2x00dev, "DPD: null frame not sent\n");
++}
++
++static int rt2800_dpd_sign(int val, int bits)
++{
++	return (val & BIT(bits - 1)) ? val - BIT(bits) : val;
++}
++
++/*
++ * TX ALC level the MAC will use for this chain (same computation as
++ * the TX ALC hardware).  Returns false if DPD must not run.
++ */
++static bool rt2800_dpd_txalc_req(struct rt2x00_dev *rt2x00dev, int chain,
++				 int *alc_sat)
++{
++	u32 cfg0, cfg1, vga3, bb, rf;
++	int init, limit, temp_comp, vga2, vga3v, atten, gain_bb = 0;
++	int gain_rf = 0, req, req_at, skip2, skip3, target, delta;
++	u16 eeprom;
++
++	cfg0 = rt2800_register_read(rt2x00dev, TX_ALC_CFG_0);
++	cfg1 = rt2800_register_read(rt2x00dev, TX_ALC_CFG_1);
++	vga3 = rt2800_register_read(rt2x00dev, TX_ALC_VGA3);
++
++	if (chain == 0) {
++		init = cfg0 & 0x3f;
++		limit = (cfg0 >> 16) & 0x3f;
++		vga2 = (vga3 >> 16) & 0x1f;
++		vga3v = vga3 & 0x1f;
++		atten = (cfg1 >> 20) & 0x3;
++		bb = rt2800_register_read(rt2x00dev, TX0_BB_GAIN_ATTEN);
++		rf = rt2800_register_read(rt2x00dev, TX0_RF_GAIN_ATTEN);
++	} else {
++		init = (cfg0 >> 8) & 0x3f;
++		limit = (cfg0 >> 24) & 0x3f;
++		vga2 = (vga3 >> 24) & 0x1f;
++		vga3v = (vga3 >> 8) & 0x1f;
++		atten = (cfg1 >> 22) & 0x3;
++		bb = rt2800_register_read(rt2x00dev, TX1_BB_GAIN_ATTEN);
++		rf = rt2800_register_read(rt2x00dev, TX1_RF_GAIN_ATTEN);
++	}
++
++	temp_comp = rt2800_dpd_sign(cfg1 & 0x3f, 6);
++
++	if (atten >= 1 && atten <= 3) {
++		gain_bb = rt2800_dpd_sign((bb >> (8 * atten)) & 0x1f, 5);
++		gain_rf = rt2800_dpd_sign((rf >> (8 * atten)) & 0x7f, 7);
++	}
++
++	req = min(init + temp_comp, limit);
++	req_at = req < 0 ? req - gain_bb - gain_rf : req;
++	skip2 = req_at > 23 ? req_at + vga2 : req_at;
++	skip3 = skip2 > 35 ? skip2 + vga3v : skip2;
++	*alc_sat = clamp(skip3, 0, 47);
++
++	/* only between 15 and 20 dBm (0.5 dB units), as the vendor driver */
++	eeprom = rt2x00_eeprom_read(rt2x00dev, 0xd0 / 2);
++	target = (eeprom & 0xff) == 0xff ? 0x1e : (eeprom & 0x3f);
++	delta = rt2800_dpd_sign(cfg1 & 0x3f, 6);
++	target += delta;
++
++	if (target < 30 || target > 40) {
++		rt2x00_dbg(rt2x00dev, "DPD: chain %d skipped, target power %d\n",
++			   chain, target);
++		return false;
++	}
++	return true;
++}
++
++/* returns 0: skipped, 1: not needed, 2: calibrated (maybe failed) */
++static int rt2800_dpd_calibration_chain(struct rt2x00_dev *rt2x00dev,
++					struct rt6352_dpd_state *st, int chain)
++{
++	const u8 bank_rx = chain ? 7 : 5, bank_tx = chain ? 6 : 4;
++	u32 save_sys_ctrl, save_pin_cfg, save_alc_cfg0, cfg0, cfg0_2nd;
++	u8 save_bbp4, save_bbp27, save_bbp65, save_bbp159;
++	u8 save_bbp241 = 0, save_bbp242, save_bbp244;
++	u8 save_rf0_1, save_rx1, save_rx3, save_rx4, save_rx17, save_rx18;
++	u8 save_rx19, save_rx20, save_tx11, save_tx13, save_tx19, save_tx21;
++	u8 save_tx22, val, am63;
++	bool chipver2 = rt2800_hw_get_chipver(rt2x00dev) > 1;
++	int alc_sat, loop, retry, vga_idx, i, pass_thres, am_sum, am10, diff;
++	bool success;
++
++	if (!rt2800_dpd_txalc_req(rt2x00dev, chain, &alc_sat))
++		return 0;
++
++	if ((st->alc_tag[chain][0] || st->alc_tag[chain][1]) &&
++	    alc_sat <= (st->alc_tag[chain][1] | 0x3) &&
++	    alc_sat >= (st->alc_tag[chain][0] & ~0x3))
++		return 1;
++
++	save_sys_ctrl = rt2800_register_read(rt2x00dev, MAC_SYS_CTRL);
++	save_pin_cfg = rt2800_register_read(rt2x00dev, TX_PIN_CFG);
++	save_alc_cfg0 = rt2800_register_read(rt2x00dev, TX_ALC_CFG_0);
++
++	save_bbp4 = rt2800_bbp_read(rt2x00dev, 4);
++	save_bbp27 = rt2800_bbp_read(rt2x00dev, 27);
++	save_bbp65 = rt2800_bbp_read(rt2x00dev, 65);
++	rt2800_bbp_write(rt2x00dev, 158, 140);
++	save_bbp159 = rt2800_bbp_read(rt2x00dev, 159);
++	if (chipver2)
++		save_bbp241 = rt2800_bbp_read(rt2x00dev, 241);
++	save_bbp242 = rt2800_bbp_read(rt2x00dev, 242);
++	save_bbp244 = rt2800_bbp_read(rt2x00dev, 244);
++
++	save_rf0_1 = rt2800_rfcsr_read_bank(rt2x00dev, 0, 1);
++	save_tx11 = rt2800_rfcsr_read_bank(rt2x00dev, bank_tx, 11);
++	save_tx13 = rt2800_rfcsr_read_bank(rt2x00dev, bank_tx, 13);
++	save_tx19 = rt2800_rfcsr_read_bank(rt2x00dev, bank_tx, 19);
++	save_tx21 = rt2800_rfcsr_read_bank(rt2x00dev, bank_tx, 21);
++	save_tx22 = rt2800_rfcsr_read_bank(rt2x00dev, bank_tx, 22);
++	save_rx1 = rt2800_rfcsr_read_bank(rt2x00dev, bank_rx, 1);
++	save_rx3 = rt2800_rfcsr_read_bank(rt2x00dev, bank_rx, 3);
++	save_rx4 = rt2800_rfcsr_read_bank(rt2x00dev, bank_rx, 4);
++	save_rx17 = rt2800_rfcsr_read_bank(rt2x00dev, bank_rx, 17);
++	save_rx18 = rt2800_rfcsr_read_bank(rt2x00dev, bank_rx, 18);
++	save_rx19 = rt2800_rfcsr_read_bank(rt2x00dev, bank_rx, 19);
++	save_rx20 = rt2800_rfcsr_read_bank(rt2x00dev, bank_rx, 20);
++
++	/* MAC in TX idle, RF loopback from this chain's PA */
++	rt2800_register_write(rt2x00dev, TX_PIN_CFG,
++			      chain ? 0x001c0080 : 0x001c0020);
++	rt2800_rfcsr_write_bank(rt2x00dev, 0, 1, chain ? 0x42 : 0x41);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 11, 0x51);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 13, 0x3c);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 17, 0x80);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 18, 0xf1);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 19, 0xa1);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 20, 0x01);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 19, 0xa0);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 21, 0x12);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 22, 0xa1);
++
++	rt2800_bbp_write(rt2x00dev, 186, 0x00);
++	rt2800_bbp_write(rt2x00dev, 187, 0x00);
++	rt2800_bbp_write(rt2x00dev, 188, 0x00);
++
++	/* two LUTs (tags), 4 ALC steps apart */
++	cfg0 = rt2800_register_read(rt2x00dev, TX_ALC_CFG_0);
++	cfg0_2nd = (cfg0 >> (8 * chain)) & 0x3f;
++	if ((alc_sat & 0x3) > 1) {
++		st->alc_tag[chain][1] = alc_sat + 4;
++		st->alc_tag[chain][0] = alc_sat;
++		cfg0_2nd += 4;
++	} else {
++		st->alc_tag[chain][1] = alc_sat;
++		st->alc_tag[chain][0] = alc_sat - 4;
++		cfg0_2nd -= 4;
++	}
++	cfg0_2nd = (cfg0 & ~(0x3f << (8 * chain))) |
++		   ((cfg0_2nd & 0x3f) << (8 * chain));
++	st->tag_ok[chain][0] = false;
++	st->tag_ok[chain][1] = false;
++
++	for (loop = 0; loop < 2; loop++) {
++		rt2800_register_write(rt2x00dev, TX_ALC_CFG_0,
++				      loop ? cfg0_2nd : cfg0);
++
++		rt2800_register_write(rt2x00dev, MAC_SYS_CTRL, 0x00);
++		rt2800_wait_mac_idle_rt6352(rt2x00dev, 1000, 50);
++
++		/* send a frame so the PA is driven at this level */
++		rt2800_register_write(rt2x00dev, MAC_SYS_CTRL, 0x04);
++		rt2800_dpd_kick_null_frame(rt2x00dev);
++		rt2800_register_write(rt2x00dev, MAC_SYS_CTRL, 0x00);
++		rt2800_wait_mac_idle_rt6352(rt2x00dev, 500, 100);
++
++		rt2800_bbp_write(rt2x00dev, chain ? 24 : 23, 0x10);
++		rt2800_bbp_write(rt2x00dev, 109, 0x00);
++		rt2800_bbp_write(rt2x00dev, 110, 0x00);
++		rt2800_bbp_write(rt2x00dev, 27, 0x00);
++		rt2800_bbp_write(rt2x00dev, 65, 0x39);
++		rt2800_bbp_write(rt2x00dev, 186, 0x00);
++		rt2800_bbp_write(rt2x00dev, 187, 0x02);
++		rt2800_bbp_write(rt2x00dev, 188, 0x0a);
++		rt2800_bbp_write(rt2x00dev, 187, 0x03);
++		rt2800_bbp_write(rt2x00dev, 188, chain ? 0x21 : 0x41);
++		if (chipver2) {
++			rt2800_bbp_write(rt2x00dev, 241, 0x04);
++			rt2800_bbp_write(rt2x00dev, 242, 0x00);
++		} else {
++			rt2800_bbp_write(rt2x00dev, 242, 0x10);
++		}
++
++		pass_thres = RT6352_DPD_PASS_THRES;
++		vga_idx = 5;
++		success = false;
++
++		val = rt2800_bbp_read(rt2x00dev, 4);
++		rt2800_bbp_write(rt2x00dev, 4, (val & ~0x18) | 0x10);
++
++		for (retry = 0; retry < RT6352_DPD_MAX_RETRY; retry++) {
++			/* find a VGA gain: large swing, no ADC clipping */
++			while (vga_idx >= 0 &&
++			       vga_idx < ARRAY_SIZE(rt6352_dpd_vga_code)) {
++				val = 0x20 | rt6352_dpd_vga_code[vga_idx];
++				rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 3, val);
++				rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 4, val);
++
++				rt2800_register_write(rt2x00dev, MAC_SYS_CTRL, 0x08);
++				rt2800_register_write(rt2x00dev, MAC_SYS_CTRL, 0x00);
++				rt2800_wait_mac_idle_rt6352(rt2x00dev, 10000, 50);
++
++				/* debug tone on, start capture */
++				rt2800_bbp_write(rt2x00dev, 244, chipver2 ? 0x11 : 0x2a);
++				rt2800_bbp_write(rt2x00dev, 186, 0x00);
++				rt2800_bbp_write(rt2x00dev, 187, 0x01);
++				rt2800_bbp_write(rt2x00dev, 188,
++						 0x80 | (2 * chain) | loop);
++
++				for (i = 0; i < 1000; i++) {
++					if (!(rt2800_bbp_read(rt2x00dev, 188) & 0x80))
++						break;
++					udelay(50);
++				}
++
++				rt2800_bbp_write(rt2x00dev, 244, 0x00);
++
++				rt2800_bbp_write(rt2x00dev, 186, 0x01);
++				rt2800_bbp_write(rt2x00dev, 187, 0xff);
++				am63 = rt2800_bbp_read(rt2x00dev, 188);
++
++				if (am63 < 180)
++					vga_idx++;
++				else if (am63 > 245)
++					vga_idx--;
++				else
++					break;
++			}
++
++			if (vga_idx < 0 ||
++			    vga_idx >= ARRAY_SIZE(rt6352_dpd_vga_code))
++				break;
++
++			/* protection: the first AM entries must be linear */
++			rt2800_bbp_write(rt2x00dev, 186, 0x01);
++			am_sum = 0;
++			for (i = 0; i < 11; i++) {
++				rt2800_bbp_write(rt2x00dev, 187, 4 * i + 3);
++				am_sum += rt2800_bbp_read(rt2x00dev, 188);
++			}
++			rt2800_bbp_write(rt2x00dev, 187, 0x2b);
++			am10 = rt2800_bbp_read(rt2x00dev, 188);
++			diff = am_sum - (11 * am10) / 2;
++
++			if (chain == 0) {
++				if (diff >= -3 && diff <= pass_thres)
++					success = true;
++				else if (retry == 3)
++					pass_thres += 3;
++			} else if (retry == 4) {
++				success = diff >= -9 && diff <= 12;
++			} else {
++				success = diff >= -5 && diff <= 5;
++			}
++
++			if (success) {
++				st->tag_ok[chain][loop] = true;
++				break;
++			}
++		}
++
++		rt2x00_dbg(rt2x00dev, "DPD: chain %d tag %d %s (vga %d)\n",
++			   chain, loop, success ? "ok" : "failed", vga_idx);
++	}
++
++	/* restore RF */
++	rt2800_rfcsr_write_bank(rt2x00dev, 0, 1, save_rf0_1);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 1, save_rx1);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 17, save_rx17);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 18, save_rx18);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 19, save_rx19);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 20, save_rx20);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 11, save_tx11);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 13, save_tx13);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 19, save_tx19);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 21, save_tx21);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_tx, 22, save_tx22);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 3, save_rx3);
++	rt2800_rfcsr_write_bank(rt2x00dev, bank_rx, 4, save_rx4);
++
++	/* restore BBP (R4 keeps the bandwidth bits as they were) */
++	rt2800_bbp_write(rt2x00dev, 4, save_bbp4);
++	rt2800_bbp_write(rt2x00dev, 21, 0x01);
++	udelay(3);
++	rt2800_bbp_write(rt2x00dev, 21, 0x00);
++	rt2800_bbp_write(rt2x00dev, 27, save_bbp27);
++	rt2800_bbp_write(rt2x00dev, 65, save_bbp65);
++	rt2800_bbp_write(rt2x00dev, 158, 140);
++	rt2800_bbp_write(rt2x00dev, 159, save_bbp159);
++	if (chipver2)
++		rt2800_bbp_write(rt2x00dev, 241, save_bbp241);
++	rt2800_bbp_write(rt2x00dev, 242, save_bbp242);
++	rt2800_bbp_write(rt2x00dev, 244, save_bbp244);
++
++	/* restore MAC */
++	rt2800_register_write(rt2x00dev, TX_ALC_CFG_0, save_alc_cfg0);
++	rt2800_register_write(rt2x00dev, TX_PIN_CFG, save_pin_cfg);
++	rt2800_register_write(rt2x00dev, MAC_SYS_CTRL, save_sys_ctrl);
++
++	return 2;
++}
++
++/* workaround for the AM-PM inversion caused by IQ swap (chip ver 1) */
++static void rt2800_dpd_am_pm_inversion(struct rt2x00_dev *rt2x00dev, int chain)
++{
++	int k, pm;
++
++	rt2800_bbp_write(rt2x00dev, 186, chain ? 0x04 : 0x02);
++	for (k = 0; k < 64; k++) {
++		rt2800_bbp_write(rt2x00dev, 187, 4 * k + 1);
++		pm = rt2800_bbp_read(rt2x00dev, 188) << 8;
++		rt2800_bbp_write(rt2x00dev, 187, 4 * k + 2);
++		pm |= rt2800_bbp_read(rt2x00dev, 188);
++
++		if (pm > 512)
++			pm -= 1024;
++		pm = -pm;
++		if (pm < 0)
++			pm += 1024;
++
++		rt2800_bbp_write(rt2x00dev, 187, 4 * k + 1);
++		rt2800_bbp_write(rt2x00dev, 188, pm >> 8);
++		rt2800_bbp_write(rt2x00dev, 187, 4 * k + 2);
++		rt2800_bbp_write(rt2x00dev, 188, pm & 0xff);
++	}
++}
++
++static void rt2800_dpd_am_am_scaling(struct rt2x00_dev *rt2x00dev, int chain)
++{
++	int loop, k, delta, scale;
++	u8 am;
++
++	for (loop = 0; loop < 2; loop++) {
++		rt2800_bbp_write(rt2x00dev, 186, 2 + 2 * chain + loop);
++		for (k = 0; k < 64; k++) {
++			/* 0 for entries 0-23, 0.5 for 24-31, 1.0 above */
++			scale = k < 24 ? 0 : (k < 32 ? 5 : 10);
++
++			rt2800_bbp_write(rt2x00dev, 187, 4 * k + 3);
++			am = rt2800_bbp_read(rt2x00dev, 188);
++			delta = am - 128;
++			if (scale && delta > 0)
++				am = 128 + (delta * scale) / 10;
++			else
++				am = 128;
++			rt2800_bbp_write(rt2x00dev, 188, am);
++			udelay(100);
++		}
++	}
++}
++
++static void rt2800_dpd_calibration_rt6352(struct rt2x00_dev *rt2x00dev)
++{
++	struct rt6352_dpd_state st = { };
++	bool two = rt2x00dev->default_ant.tx_chain_num > 1;
++	int ant0, ant1 = 0, i;
++	u8 bbp;
++
++	rt2800_dpd_prepare_null_frame(rt2x00dev);
++
++	ant0 = rt2800_dpd_calibration_chain(rt2x00dev, &st, 0);
++	if (two)
++		ant1 = rt2800_dpd_calibration_chain(rt2x00dev, &st, 1);
++
++	if (ant0 != 2 && ant1 != 2)
++		return;
++
++	/* no DPD compensation while the LUTs are post-processed */
++	bbp = rt2800_bbp_read(rt2x00dev, 4);
++	rt2800_bbp_write(rt2x00dev, 4, (bbp & ~0x18) | 0x10);
++
++	/* clear the first failed LUT, then LUTs 6-13 */
++	if (!st.tag_ok[0][0])
++		i = 2;
++	else if (!st.tag_ok[0][1])
++		i = 3;
++	else if (!st.tag_ok[1][0])
++		i = 4;
++	else if (!st.tag_ok[1][1])
++		i = 5;
++	else
++		i = 0;
++	if (i) {
++		rt2800_bbp_write(rt2x00dev, 186, i);
++		rt2800_bbp_write(rt2x00dev, 186, i);
++		rt2800_bbp_write(rt2x00dev, 189, 0x0f);
++	}
++	for (i = 6; i <= 13; i++) {
++		rt2800_bbp_write(rt2x00dev, 186, i);
++		rt2800_bbp_write(rt2x00dev, 186, i);
++		rt2800_bbp_write(rt2x00dev, 189, 0x0f);
++	}
++
++	if (rt2800_hw_get_chipver(rt2x00dev) == 1) {
++		rt2800_dpd_am_pm_inversion(rt2x00dev, 0);
++		if (two)
++			rt2800_dpd_am_pm_inversion(rt2x00dev, 1);
++	}
++
++	if (ant0 == 2)
++		rt2800_dpd_am_am_scaling(rt2x00dev, 0);
++	if (two && ant1 == 2)
++		rt2800_dpd_am_am_scaling(rt2x00dev, 1);
++
++	rt2800_bbp_write(rt2x00dev, 4, bbp);
++
++	if (!st.tag_ok[0][0] && !st.tag_ok[0][1] &&
++	    !st.tag_ok[1][0] && !st.tag_ok[1][1]) {
++		rt2800_bbp_write(rt2x00dev, 186, 0x00);
++		rt2800_bbp_write(rt2x00dev, 187, 0x00);
++		rt2800_bbp_write(rt2x00dev, 188, 0x00);
++		rt2x00_info(rt2x00dev, "DPD calibration failed, compensation off\n");
++	} else {
++		/* enable DPD compensation */
++		rt2800_bbp_write(rt2x00dev, 186, 0x00);
++		rt2800_bbp_write(rt2x00dev, 187, 0x04);
++		rt2800_bbp_write(rt2x00dev, 188, 0x1c);
++		rt2800_bbp_write(rt2x00dev, 187, 0x05);
++		rt2800_bbp_write(rt2x00dev, 188, 0x12);
++		rt2800_bbp_write(rt2x00dev, 187, 0x00);
++		rt2800_bbp_write(rt2x00dev, 188, 0xc0);
++		rt2x00_info(rt2x00dev, "DPD calibration done (tx0 %d%d tx1 %d%d)\n",
++			    st.tag_ok[0][0], st.tag_ok[0][1],
++			    st.tag_ok[1][0], st.tag_ok[1][1]);
++	}
++
++	rt2800_bbp_write(rt2x00dev, 21, 0x01);
++	rt2800_bbp_write(rt2x00dev, 21, 0x00);
++}
++
+ static void rt2800_calibration_rt6352_stage2(struct rt2x00_dev *rt2x00dev)
+ {
+ 	u32 reg;
+@@ -10491,7 +11005,8 @@ static void rt2800_calibration_rt6352_stage2(struct rt2x00_dev *rt2x00dev)
+ 	rt2800_bw_filter_calibration(rt2x00dev, false);
+ 	rt2800_loft_iq_calibration(rt2x00dev);
+ 
+-	/* missing DPD calibration for internal PA devices */
++	if (!rt2x00_has_cap_external_pa(rt2x00dev))
++		rt2800_dpd_calibration_rt6352(rt2x00dev);
+ 
+ 	rt2800_rxdcoc_calibration(rt2x00dev);
+ 	rt2800_rxiq_calibration(rt2x00dev);
