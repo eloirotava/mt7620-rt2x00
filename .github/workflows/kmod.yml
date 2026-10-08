@@ -67,7 +67,12 @@ jobs:
       - name: Junta os .ko
         run: |
           mkdir -p out
-          find sdk/build_dir -path '*backports*' -name 'rt2*.ko' -exec cp -v {} out/ \;
+          # so a variante regular do mac80211 (a que o Archer usa)
+          for m in rt2x00lib rt2x00mmio rt2800lib rt2800mmio rt2800soc; do
+            f=$(find sdk/build_dir -path '*mac80211-regular*' -path '*.pkgdir*' -name "$m.ko" | head -1)
+            [ -n "$f" ] || { echo "falta $m.ko"; exit 1; }
+            cp -v "$f" out/
+          done
           for k in out/*.ko; do modinfo $k | grep -E '^vermagic' ; done | sort -u
           ls -la out
 
