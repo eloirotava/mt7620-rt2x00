@@ -26,13 +26,18 @@ jobs:
           wget -q "$SDK_URL" -O sdk.tar.zst
           mkdir sdk && tar -I zstd -xf sdk.tar.zst -C sdk --strip-components=1
           cd sdk
-          cat feeds.conf.default
+          # base fixo no commit da imagem 25.12.2 (r32802-f505120278):
+          # o mac80211 carregado no roteador e o do backports desse commit
+          sed -E 's#^src-git base .*#src-git base https://github.com/openwrt/openwrt.git^f505120278#' \
+            feeds.conf.default > feeds.conf
+          cat feeds.conf
           ./scripts/feeds update base
           ./scripts/feeds install -p base mac80211
 
       - name: Patches rt2x00 do repo
         run: |
           P=sdk/feeds/base/package/kernel/mac80211/patches/rt2x00
+          grep -E '^PKG_VERSION' sdk/feeds/base/package/kernel/mac80211/Makefile
           ls $P | tail -5
           for f in patches/*.patch; do [ -e "$f" ] && cp -v "$f" $P/; done
           true
