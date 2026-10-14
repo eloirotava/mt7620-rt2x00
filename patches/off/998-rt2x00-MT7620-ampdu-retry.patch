@@ -3,9 +3,11 @@ Subject: [PATCH] rt2x00: rt2800: MT7620 64 KB A-MPDU and vendor retry limits
 
 The MediaTek driver for the MT7620 (RT6352) allows 64 KB A-MPDUs
 (MAX_PSDU 3) and uses 15/31 hardware retries.  rt2x00 used 16 KB and
-the mac80211 limits.  Measured on an Archer C5 v4, channel 13, HT20,
-1x1 client at -63 dBm: download 22 -> 24.5 Mbit/s, TX retries
-~42% -> ~30%.  The per-station A-MPDU factor limit still applies.
+the mac80211 limits.
+
+NOT MEASURABLY BETTER: repeated A/B runs on 2026-10-14 (Archer C5 v4,
+A71 at -63 dBm, channels 11 and 13) gave the stock settings the same
+22-26 Mbit/s.  Kept off.
 
 --- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
 +++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
