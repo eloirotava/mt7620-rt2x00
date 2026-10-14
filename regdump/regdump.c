@@ -184,6 +184,28 @@ static const struct proc_ops regdump_ops = {
 	.proc_write	= regdump_write,
 };
 
+/*
+ * Totais de TX_STA_CNT1 (ok sem retry / ok com retry) e TX_STA_CNT0
+ * (falha), no mesmo formato do /proc/rt2860v2.  Os registradores zeram
+ * na leitura; o rt2x00 so os le na inicializacao, entao com ele os
+ * totais sao exatos.  Com o rt2860v2 carregado, usar o /proc dele.
+ */
+#define TX_STA_CNT0	0x170c
+#define TX_STA_CNT1	0x1710
+
+static unsigned long tx_ok, tx_retry, tx_fail;
+
+static int txcnt_show(struct seq_file *m, void *v)
+{
+	u32 c0 = rd(TX_STA_CNT0), c1 = rd(TX_STA_CNT1);
+
+	tx_ok += c1 & 0xffff;
+	tx_retry += c1 >> 16;
+	tx_fail += c0 & 0xffff;
+	seq_printf(m, "txcnt %lu %lu %lu\n", tx_ok, tx_retry, tx_fail);
+	return 0;
+}
+
 static int __init regdump_init(void)
 {
 	base = ioremap(WMAC_BASE, WMAC_SIZE);
@@ -193,11 +215,13 @@ static int __init regdump_init(void)
 		iounmap(base);
 		return -ENOMEM;
 	}
+	proc_create_single("regdump_txcnt", 0444, NULL, txcnt_show);
 	return 0;
 }
 
 static void __exit regdump_exit(void)
 {
+	remove_proc_entry("regdump_txcnt", NULL);
 	remove_proc_entry("regdump", NULL);
 	iounmap(base);
 }
