@@ -14,6 +14,7 @@
 #include <linux/delay.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/uaccess.h>
 
 #define WMAC_BASE	0x10180000
 #define WMAC_SIZE	0x2000
@@ -75,6 +76,16 @@ static int rf_read(unsigned int word)
 	return (reg >> 8) & 0xff;
 }
 
+static int rf_write(unsigned int word, u8 val)
+{
+	u32 reg;
+
+	if (wait_bit(RF_CSR_CFG, BIT(0), &reg))
+		return -1;
+	wr(RF_CSR_CFG, (word << 16) | (val << 8) | BIT(4) | BIT(0));
+	return 0;
+}
+
 /* bancos indiretos do BBP: indice em idx, dado em dat; restaura o indice */
 static void dump_indexed(struct seq_file *m, const char *name, u8 idx, u8 dat)
 {
@@ -119,12 +130,66 @@ static int regdump_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/*
+ * Escrita, uma por linha, no mesmo formato da leitura (hex):
+ *   mac <off> <val32> | bbp <reg> <val> | dcoc|glrt <reg> <val> |
+ *   rf <banco> <reg> <val>
+ * Os numeros de bbp/dcoc/glrt/rf sao decimais, como na saida.
+ */
+static ssize_t regdump_write(struct file *file, const char __user *ubuf,
+			     size_t len, loff_t *ppos)
+{
+	char buf[64], name[8];
+	unsigned int a, b, c;
+	int n, ret = 0;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = 0;
+
+	n = sscanf(buf, "%7s", name);
+	if (n != 1)
+		return -EINVAL;
+	if (!strcmp(name, "mac") && sscanf(buf, "%*s %x %x", &a, &b) == 2 &&
+	    a < WMAC_SIZE && !(a & 3))
+		wr(a, b);
+	else if (!strcmp(name, "bbp") && sscanf(buf, "%*s %u %x", &a, &b) == 2 &&
+		 a < 256)
+		ret = bbp_write(a, b);
+	else if ((!strcmp(name, "dcoc") || !strcmp(name, "glrt")) &&
+		 sscanf(buf, "%*s %u %x", &a, &b) == 2 && a < 256) {
+		u8 idx = name[0] == 'd' ? 158 : 195;
+
+		ret = bbp_write(idx, a) || bbp_write(idx + 1, b);
+	} else if (!strcmp(name, "rf") &&
+		   sscanf(buf, "%*s %u %u %x", &a, &b, &c) == 3 && a < 8 && b < 64)
+		ret = rf_write(b | (a << 6), c);
+	else
+		return -EINVAL;
+	return ret ? -ETIMEDOUT : len;
+}
+
+static int regdump_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, regdump_show, NULL);
+}
+
+static const struct proc_ops regdump_ops = {
+	.proc_open	= regdump_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+	.proc_write	= regdump_write,
+};
+
 static int __init regdump_init(void)
 {
 	base = ioremap(WMAC_BASE, WMAC_SIZE);
 	if (!base)
 		return -ENOMEM;
-	if (!proc_create_single("regdump", 0400, NULL, regdump_show)) {
+	if (!proc_create("regdump", 0600, NULL, &regdump_ops)) {
 		iounmap(base);
 		return -ENOMEM;
 	}

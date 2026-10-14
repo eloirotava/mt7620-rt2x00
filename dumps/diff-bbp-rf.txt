@@ -1,0 +1,48 @@
+volateis 51 diferentes 90
+bbp 002      rt2x00=      42 v2=      02
+bbp 006      rt2x00=      03 v2=      00
+bbp 007      rt2x00=      09 v2=      0f
+bbp 012      rt2x00=      00 v2=      07
+bbp 013      rt2x00=      20 v2=      28
+bbp 015      rt2x00=      c9 v2=      e5
+bbp 047      rt2x00=      40 v2=      44
+bbp 049      rt2x00=      0e v2=      00
+bbp 066      rt2x00=      18 v2=      28
+bbp 084      rt2x00=      19 v2=      9a
+bbp 158      rt2x00=      00 v2=      8d
+bbp 187      rt2x00=      01 v2=      00
+bbp 188      rt2x00=      00 v2=      c0
+bbp 189      rt2x00=      36 v2=      14
+bbp 195      rt2x00=      ab v2=      9d
+bbp 196      rt2x00=      30 v2=      27
+dcoc 031     rt2x00=      6d v2=      0f
+dcoc 032     rt2x00=      f7 v2=      e8
+dcoc 033     rt2x00=      18 v2=      1c
+dcoc 040     rt2x00=      00 v2=      0f
+dcoc 041     rt2x00=      01 v2=      00
+dcoc 050     rt2x00=      00 v2=      01
+dcoc 053     rt2x00=      00 v2=      3f
+dcoc 055     rt2x00=      00 v2=      01
+dcoc 059     rt2x00=      00 v2=      fe
+dcoc 070     rt2x00=      0f v2=      01
+dcoc 083     rt2x00=      06 v2=      07
+dcoc 089     rt2x00=      06 v2=      07
+dcoc 188     rt2x00=      76 v2=      06
+glrt 131     rt2x00=      32 v2=      70
+glrt 134     rt2x00=      19 v2=      70
+glrt 156     rt2x00=      3d v2=      27
+glrt 157     rt2x00=      40 v2=      27
+rf 0 34      rt2x00=      00 v2=      23
+rf 0 35      rt2x00=      00 v2=      01
+rf 5 04      rt2x00=      04 v2=      07
+rf 5 39      rt2x00=      05 v2=      04
+rf 5 40      rt2x00=      0f v2=      10
+rf 5 41      rt2x00=      14 v2=      16
+rf 5 44      rt2x00=      06 v2=      03
+rf 7 04      rt2x00=      04 v2=      07
+rf 7 39      rt2x00=      00 v2=      ff
+rf 7 41      rt2x00=      0b v2=      0e
+rf 7 44      rt2x00=      e8 v2=      e7
+rf 7 45      rt2x00=      e8 v2=      e9
+rf 7 49      rt2x00=      00 v2=      3f
+rf 7 51      rt2x00=      00 v2=      3f
