@@ -29,6 +29,21 @@ desses ajustes nem os grupos BBP/GLRT/DCOC/RF do vendor (aplicados com
 Com este cliente o rt2x00 empata no download; a diferenca de 2x do S22
 em 2026-10-08 nao se repetiu.  Sobra talvez o upload.
 
+Bateria limpa (2026-10-14: canal 13, 2.4 do Cudy desligado, A71 parado,
+iperf3 20 s, drivers alternados; retries de TX_STA_CNT do chip, no
+rt2860v2 via patch 005 do mt7620-rt2860v2):
+
+| rodada | rt2x00 down | retry/falha | rt2860v2 down | retry/falha |
+|---|---|---|---|---|
+| 1 | 18,5 | 31,6% / 0,08% | 9,0 | 33,6% / 0 |
+| 2 | 17,9 | 33,9% / 0,10% | 11,2 | 34,1% / 0 |
+| 3 | 17,2 | 37,3% / 0,12% | 12,5 | 23,5% / 0 |
+
+Upload (C5 so manda ACKs): rt2x00 5,8 / 6,2 / 6,3; rt2860v2 5,3 / 5,5 / 6,6.
+Conclusao: o rt2x00 de fabrica tem ~60% mais download, upload igual e
+retries na mesma faixa.  Unica diferenca a favor do vendor: ~0,1% de
+quadros descartados (falha apos todos os retries) contra 0.
+
 Do lado de RX/RF: BBP 66 (ganho, o link tuner reescreve), BBP 84,
 GLRT 131/134/156/157, DCOC 31-89, RF bancos 5 e 7 (regs 4, 39-51) e
 RF 0/34-35.
