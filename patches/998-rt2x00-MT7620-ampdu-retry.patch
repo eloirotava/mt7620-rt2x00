@@ -1,0 +1,38 @@
+From: Eloi Rotava <eloi@rotava.com>
+Subject: [PATCH] rt2x00: rt2800: MT7620 64 KB A-MPDU and vendor retry limits
+
+The MediaTek driver for the MT7620 (RT6352) allows 64 KB A-MPDUs
+(MAX_PSDU 3) and uses 15/31 hardware retries.  rt2x00 used 16 KB and
+the mac80211 limits.  Measured on an Archer C5 v4, channel 13, HT20,
+1x1 client at -63 dBm: download 22 -> 24.5 Mbit/s, TX retries
+~42% -> ~30%.  The per-station A-MPDU factor limit still applies.
+
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+@@ -6047,6 +6047,9 @@
+ 	rt2x00_set_field32(&reg, MAX_LEN_CFG_MAX_MPDU, AGGREGATION_SIZE);
+ 	if (rt2x00_is_usb(rt2x00dev)) {
+ 		drv_data->max_psdu = 3;
++	} else if (rt2x00_rt(rt2x00dev, RT6352)) {
++		/* 64 KB, like the MediaTek driver for the MT7620 */
++		drv_data->max_psdu = 3;
+ 	} else if (rt2x00_rt_rev_gte(rt2x00dev, RT2872, REV_RT2872E) ||
+ 		   rt2x00_rt(rt2x00dev, RT2883) ||
+ 		   rt2x00_rt_rev_lt(rt2x00dev, RT3070, REV_RT3070E)) {
+@@ -11714,6 +11717,16 @@
+ 	rt2x00dev->hw->wiphy->retry_long = 2;
+ 
+ 	/*
++	 * The MT7620 vendor driver retries much more in hardware (15/31);
++	 * with the low limits the many retries of this radio turn into
++	 * lost frames and TCP throughput collapses.
++	 */
++	if (rt2x00_rt(rt2x00dev, RT6352)) {
++		rt2x00dev->hw->wiphy->retry_short = 15;
++		rt2x00dev->hw->wiphy->retry_long = 31;
++	}
++
++	/*
+ 	 * Initialize all hw fields.
+ 	 */
+ 	ieee80211_hw_set(rt2x00dev->hw, REPORTS_TX_ACK_STATUS);
