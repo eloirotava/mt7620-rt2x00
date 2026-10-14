@@ -1,0 +1,51 @@
+name: regdump
+
+# Modulo que despeja MAC/BBP/RF do wifi do MT7620 em /proc/regdump, para
+# comparar o estado do radio com o rt2800soc e com o rt2860v2.
+
+on:
+  push:
+    paths:
+      - 'regdump/**'
+      - '.github/workflows/regdump.yml'
+  workflow_dispatch:
+
+env:
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.2/targets/ramips/mt7620/openwrt-sdk-25.12.2-ramips-mt7620_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencias
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Cache do SDK
+        id: sdk
+        uses: actions/cache@v4
+        with:
+          path: sdk
+          key: sdk-25.12.2-ramips-mt7620-v1
+
+      - name: SDK
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: |
+          wget -q "$SDK_URL" -O sdk.tar.zst
+          mkdir sdk && tar -I zstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Compila
+        run: |
+          export STAGING_DIR=$PWD/sdk/staging_dir
+          LINUX=$(ls -d sdk/build_dir/target-*/linux-ramips_mt7620/linux-6.12.*)
+          TC=$(ls -d sdk/staging_dir/toolchain-*/bin)
+          make -C $LINUX M=$PWD/regdump ARCH=mips \
+            CROSS_COMPILE=$PWD/$TC/mipsel-openwrt-linux-musl- modules
+          modinfo regdump/regdump.ko | grep vermagic
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regdump-ko
+          path: regdump/regdump.ko
